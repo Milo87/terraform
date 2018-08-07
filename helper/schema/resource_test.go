@@ -5,7 +5,9 @@ import (
 	"reflect"
 	"strconv"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/terraform"
 )
 
@@ -52,13 +54,241 @@ func TestResourceApply_create(t *testing.T) {
 			"id":  "foo",
 			"foo": "42",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "2",
 		},
 	}
 
 	if !reflect.DeepEqual(actual, expected) {
 		t.Fatalf("bad: %#v", actual)
+	}
+}
+
+func TestResourceApply_Timeout_state(t *testing.T) {
+	r := &Resource{
+		SchemaVersion: 2,
+		Schema: map[string]*Schema{
+			"foo": &Schema{
+				Type:     TypeInt,
+				Optional: true,
+			},
+		},
+		Timeouts: &ResourceTimeout{
+			Create: DefaultTimeout(40 * time.Minute),
+			Update: DefaultTimeout(80 * time.Minute),
+			Delete: DefaultTimeout(40 * time.Minute),
+		},
+	}
+
+	called := false
+	r.Create = func(d *ResourceData, m interface{}) error {
+		called = true
+		d.SetId("foo")
+		return nil
+	}
+
+	var s *terraform.InstanceState = nil
+
+	d := &terraform.InstanceDiff{
+		Attributes: map[string]*terraform.ResourceAttrDiff{
+			"foo": &terraform.ResourceAttrDiff{
+				New: "42",
+			},
+		},
+	}
+
+	diffTimeout := &ResourceTimeout{
+		Create: DefaultTimeout(40 * time.Minute),
+		Update: DefaultTimeout(80 * time.Minute),
+		Delete: DefaultTimeout(40 * time.Minute),
+	}
+
+	if err := diffTimeout.DiffEncode(d); err != nil {
+		t.Fatalf("Error encoding timeout to diff: %s", err)
+	}
+
+	actual, err := r.Apply(s, d, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !called {
+		t.Fatal("not called")
+	}
+
+	expected := &terraform.InstanceState{
+		ID: "foo",
+		Attributes: map[string]string{
+			"id":  "foo",
+			"foo": "42",
+		},
+		Meta: map[string]interface{}{
+			"schema_version": "2",
+			TimeoutKey:       expectedForValues(40, 0, 80, 40, 0),
+		},
+	}
+
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("Not equal in Timeout State:\n\texpected: %#v\n\tactual: %#v", expected.Meta, actual.Meta)
+	}
+}
+
+// Regression test to ensure that the meta data is read from state, if a
+// resource is destroyed and the timeout meta is no longer available from the
+// config
+func TestResourceApply_Timeout_destroy(t *testing.T) {
+	timeouts := &ResourceTimeout{
+		Create: DefaultTimeout(40 * time.Minute),
+		Update: DefaultTimeout(80 * time.Minute),
+		Delete: DefaultTimeout(40 * time.Minute),
+	}
+
+	r := &Resource{
+		Schema: map[string]*Schema{
+			"foo": &Schema{
+				Type:     TypeInt,
+				Optional: true,
+			},
+		},
+		Timeouts: timeouts,
+	}
+
+	called := false
+	var delTimeout time.Duration
+	r.Delete = func(d *ResourceData, m interface{}) error {
+		delTimeout = d.Timeout(TimeoutDelete)
+		called = true
+		return nil
+	}
+
+	s := &terraform.InstanceState{
+		ID: "bar",
+	}
+
+	if err := timeouts.StateEncode(s); err != nil {
+		t.Fatalf("Error encoding to state: %s", err)
+	}
+
+	d := &terraform.InstanceDiff{
+		Destroy: true,
+	}
+
+	actual, err := r.Apply(s, d, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !called {
+		t.Fatal("delete not called")
+	}
+
+	if *timeouts.Delete != delTimeout {
+		t.Fatalf("timeouts don't match, expected (%#v), got (%#v)", timeouts.Delete, delTimeout)
+	}
+
+	if actual != nil {
+		t.Fatalf("bad: %#v", actual)
+	}
+}
+
+func TestResourceDiff_Timeout_diff(t *testing.T) {
+	r := &Resource{
+		Schema: map[string]*Schema{
+			"foo": &Schema{
+				Type:     TypeInt,
+				Optional: true,
+			},
+		},
+		Timeouts: &ResourceTimeout{
+			Create: DefaultTimeout(40 * time.Minute),
+			Update: DefaultTimeout(80 * time.Minute),
+			Delete: DefaultTimeout(40 * time.Minute),
+		},
+	}
+
+	r.Create = func(d *ResourceData, m interface{}) error {
+		d.SetId("foo")
+		return nil
+	}
+
+	raw, err := config.NewRawConfig(
+		map[string]interface{}{
+			"foo": 42,
+			"timeouts": []map[string]interface{}{
+				map[string]interface{}{
+					"create": "2h",
+				}},
+		})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	var s *terraform.InstanceState = nil
+	conf := terraform.NewResourceConfig(raw)
+
+	actual, err := r.Diff(s, conf, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	expected := &terraform.InstanceDiff{
+		Attributes: map[string]*terraform.ResourceAttrDiff{
+			"foo": &terraform.ResourceAttrDiff{
+				New: "42",
+			},
+		},
+	}
+
+	diffTimeout := &ResourceTimeout{
+		Create: DefaultTimeout(120 * time.Minute),
+		Update: DefaultTimeout(80 * time.Minute),
+		Delete: DefaultTimeout(40 * time.Minute),
+	}
+
+	if err := diffTimeout.DiffEncode(expected); err != nil {
+		t.Fatalf("Error encoding timeout to diff: %s", err)
+	}
+
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("Not equal in Timeout Diff:\n\texpected: %#v\n\tactual: %#v", expected.Meta, actual.Meta)
+	}
+}
+
+func TestResourceDiff_CustomizeFunc(t *testing.T) {
+	r := &Resource{
+		Schema: map[string]*Schema{
+			"foo": &Schema{
+				Type:     TypeInt,
+				Optional: true,
+			},
+		},
+	}
+
+	var called bool
+
+	r.CustomizeDiff = func(d *ResourceDiff, m interface{}) error {
+		called = true
+		return nil
+	}
+
+	raw, err := config.NewRawConfig(
+		map[string]interface{}{
+			"foo": 42,
+		})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	var s *terraform.InstanceState
+	conf := terraform.NewResourceConfig(raw)
+
+	_, err = r.Diff(s, conf, nil)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !called {
+		t.Fatalf("diff customization not called")
 	}
 }
 
@@ -162,7 +392,7 @@ func TestResourceApply_destroyCreate(t *testing.T) {
 		Attributes: map[string]string{
 			"id":        "foo",
 			"foo":       "42",
-			"tags.#":    "1",
+			"tags.%":    "1",
 			"tags.Name": "foo",
 		},
 	}
@@ -210,7 +440,7 @@ func TestResourceApply_destroyPartial(t *testing.T) {
 			"id":  "bar",
 			"foo": "42",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "3",
 		},
 	}
@@ -399,14 +629,14 @@ func TestResourceInternalValidate(t *testing.T) {
 		Writable bool
 		Err      bool
 	}{
-		{
+		0: {
 			nil,
 			true,
 			true,
 		},
 
 		// No optional and no required
-		{
+		1: {
 			&Resource{
 				Schema: map[string]*Schema{
 					"foo": &Schema{
@@ -421,7 +651,7 @@ func TestResourceInternalValidate(t *testing.T) {
 		},
 
 		// Update undefined for non-ForceNew field
-		{
+		2: {
 			&Resource{
 				Create: func(d *ResourceData, meta interface{}) error { return nil },
 				Schema: map[string]*Schema{
@@ -436,7 +666,7 @@ func TestResourceInternalValidate(t *testing.T) {
 		},
 
 		// Update defined for ForceNew field
-		{
+		3: {
 			&Resource{
 				Create: func(d *ResourceData, meta interface{}) error { return nil },
 				Update: func(d *ResourceData, meta interface{}) error { return nil },
@@ -453,7 +683,7 @@ func TestResourceInternalValidate(t *testing.T) {
 		},
 
 		// non-writable doesn't need Update, Create or Delete
-		{
+		4: {
 			&Resource{
 				Schema: map[string]*Schema{
 					"goo": &Schema{
@@ -467,7 +697,7 @@ func TestResourceInternalValidate(t *testing.T) {
 		},
 
 		// non-writable *must not* have Create
-		{
+		5: {
 			&Resource{
 				Create: func(d *ResourceData, meta interface{}) error { return nil },
 				Schema: map[string]*Schema{
@@ -480,13 +710,177 @@ func TestResourceInternalValidate(t *testing.T) {
 			false,
 			true,
 		},
+
+		// writable must have Read
+		6: {
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Delete: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"goo": &Schema{
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+			},
+			true,
+			true,
+		},
+
+		// writable must have Delete
+		7: {
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Read:   func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"goo": &Schema{
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+			},
+			true,
+			true,
+		},
+
+		8: { // Reserved name at root should be disallowed
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Read:   func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Delete: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"count": {
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+			},
+			true,
+			true,
+		},
+
+		9: { // Reserved name at nested levels should be allowed
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Read:   func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Delete: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"parent_list": &Schema{
+						Type:     TypeString,
+						Optional: true,
+						Elem: &Resource{
+							Schema: map[string]*Schema{
+								"provisioner": {
+									Type:     TypeString,
+									Optional: true,
+								},
+							},
+						},
+					},
+				},
+			},
+			true,
+			false,
+		},
+
+		10: { // Provider reserved name should be allowed in resource
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Read:   func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Delete: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"alias": &Schema{
+						Type:     TypeString,
+						Optional: true,
+					},
+				},
+			},
+			true,
+			false,
+		},
+
+		11: { // ID should be allowed in data source
+			&Resource{
+				Read: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"id": &Schema{
+						Type:     TypeString,
+						Optional: true,
+					},
+				},
+			},
+			false,
+			false,
+		},
+
+		12: { // Deprecated ID should be allowed in resource
+			&Resource{
+				Create: func(d *ResourceData, meta interface{}) error { return nil },
+				Read:   func(d *ResourceData, meta interface{}) error { return nil },
+				Update: func(d *ResourceData, meta interface{}) error { return nil },
+				Delete: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"id": &Schema{
+						Type:       TypeString,
+						Optional:   true,
+						Deprecated: "Use x_id instead",
+					},
+				},
+			},
+			true,
+			false,
+		},
+
+		13: { // non-writable must not define CustomizeDiff
+			&Resource{
+				Read: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"goo": &Schema{
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+				CustomizeDiff: func(*ResourceDiff, interface{}) error { return nil },
+			},
+			false,
+			true,
+		},
+		14: { // Deprecated resource
+			&Resource{
+				Read: func(d *ResourceData, meta interface{}) error { return nil },
+				Schema: map[string]*Schema{
+					"goo": &Schema{
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+				DeprecationMessage: "This resource has been deprecated.",
+			},
+			true,
+			true,
+		},
 	}
 
 	for i, tc := range cases {
-		err := tc.In.InternalValidate(schemaMap{}, tc.Writable)
-		if err != nil != tc.Err {
-			t.Fatalf("%d: bad: %s", i, err)
-		}
+		t.Run(fmt.Sprintf("#%d", i), func(t *testing.T) {
+			sm := schemaMap{}
+			if tc.In != nil {
+				sm = schemaMap(tc.In.Schema)
+			}
+
+			err := tc.In.InternalValidate(sm, tc.Writable)
+			if err != nil && !tc.Err {
+				t.Fatalf("%d: expected validation to pass: %s", i, err)
+			}
+			if err == nil && tc.Err {
+				t.Fatalf("%d: expected validation to fail", i)
+			}
+		})
 	}
 }
 
@@ -522,7 +916,7 @@ func TestResourceRefresh(t *testing.T) {
 			"id":  "bar",
 			"foo": "13",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "2",
 		},
 	}
@@ -713,7 +1107,7 @@ func TestResourceRefresh_needsMigration(t *testing.T) {
 		Attributes: map[string]string{
 			"oldfoo": "1.2",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "1",
 		},
 	}
@@ -729,7 +1123,7 @@ func TestResourceRefresh_needsMigration(t *testing.T) {
 			"id":     "bar",
 			"newfoo": "13",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "2",
 		},
 	}
@@ -767,7 +1161,7 @@ func TestResourceRefresh_noMigrationNeeded(t *testing.T) {
 		Attributes: map[string]string{
 			"newfoo": "12",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "2",
 		},
 	}
@@ -783,7 +1177,7 @@ func TestResourceRefresh_noMigrationNeeded(t *testing.T) {
 			"id":     "bar",
 			"newfoo": "13",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "2",
 		},
 	}
@@ -835,7 +1229,7 @@ func TestResourceRefresh_stateSchemaVersionUnset(t *testing.T) {
 			"id":     "bar",
 			"newfoo": "13",
 		},
-		Meta: map[string]string{
+		Meta: map[string]interface{}{
 			"schema_version": "1",
 		},
 	}
@@ -909,7 +1303,7 @@ func TestResourceData(t *testing.T) {
 	}
 
 	// Set expectations
-	state.Meta = map[string]string{
+	state.Meta = map[string]interface{}{
 		"schema_version": "2",
 	}
 
@@ -936,5 +1330,41 @@ func TestResourceData_blank(t *testing.T) {
 	}
 	if v := data.Get("foo"); v != 0 {
 		t.Fatalf("bad: %#v", v)
+	}
+}
+
+func TestResourceData_timeouts(t *testing.T) {
+	one := 1 * time.Second
+	two := 2 * time.Second
+	three := 3 * time.Second
+	four := 4 * time.Second
+	five := 5 * time.Second
+
+	timeouts := &ResourceTimeout{
+		Create:  &one,
+		Read:    &two,
+		Update:  &three,
+		Delete:  &four,
+		Default: &five,
+	}
+
+	r := &Resource{
+		SchemaVersion: 2,
+		Schema: map[string]*Schema{
+			"foo": &Schema{
+				Type:     TypeInt,
+				Optional: true,
+			},
+		},
+		Timeouts: timeouts,
+	}
+
+	data := r.Data(nil)
+	if data.Id() != "" {
+		t.Fatalf("err: %s", data.Id())
+	}
+
+	if !reflect.DeepEqual(timeouts, data.timeouts) {
+		t.Fatalf("incorrect ResourceData timeouts: %#v\n", *data.timeouts)
 	}
 }

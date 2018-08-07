@@ -42,11 +42,16 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool) error {
 	for _, f := range zipR.File {
 		path := dst
 		if dir {
+			// Disallow parent traversal
+			if containsDotDot(f.Name) {
+				return fmt.Errorf("entry contains '..': %s", f.Name)
+			}
+
 			path = filepath.Join(path, f.Name)
 		}
 
 		if f.FileInfo().IsDir() {
-			if dir {
+			if !dir {
 				return fmt.Errorf("expected a single file: %s", src)
 			}
 
@@ -56,6 +61,15 @@ func (d *ZipDecompressor) Decompress(dst, src string, dir bool) error {
 			}
 
 			continue
+		}
+
+		// Create the enclosing directories if we must. ZIP files aren't
+		// required to contain entries for just the directories so this
+		// can happen.
+		if dir {
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return err
+			}
 		}
 
 		// Open the file for reading

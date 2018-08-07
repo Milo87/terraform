@@ -1,8 +1,14 @@
-TEST?=$$(go list ./... | grep -v /vendor/)
-VETARGS?=-all
+VERSION?="0.3.32"
+TEST?=./...
 GOFMT_FILES?=$$(find . -name '*.go' | grep -v vendor)
+WEBSITE_REPO=github.com/hashicorp/terraform-website
 
-default: test vet
+default: test
+
+tools:
+	go get -u github.com/kardianos/govendor
+	go get -u golang.org/x/tools/cmd/stringer
+	go get -u golang.org/x/tools/cmd/cover
 
 # bin generates the releaseable binaries for Terraform
 bin: fmtcheck generate
@@ -16,25 +22,17 @@ dev: fmtcheck generate
 quickdev: generate
 	@TF_DEV=1 sh -c "'$(CURDIR)/scripts/build.sh'"
 
-# Shorthand for quickly building the core of Terraform. Note that some
-# changes will require a rebuild of everything, in which case the dev
-# target should be used.
-core-dev: generate
-	go install -tags 'core' github.com/hashicorp/terraform
-
-# Shorthand for quickly testing the core of Terraform (i.e. "not providers")
-core-test: generate
-	@echo "Testing core packages..." && go test -tags 'core' $(shell go list ./... | grep -v -E 'builtin|vendor')
-
 # Shorthand for building and installing just one plugin for local testing.
 # Run as (for example): make plugin-dev PLUGIN=provider-aws
-plugin-dev: fmtcheck generate
+plugin-dev: generate
 	go install github.com/hashicorp/terraform/builtin/bins/$(PLUGIN)
 	mv $(GOPATH)/bin/$(PLUGIN) $(GOPATH)/bin/terraform-$(PLUGIN)
 
 # test runs the unit tests
+# we run this one package at a time here because running the entire suite in
+# one command creates memory usage issues when running in Travis-CI.
 test: fmtcheck generate
-	TF_ACC= go test $(TEST) $(TESTARGS) -timeout=30s -parallel=4
+	go list $(TEST) | xargs -t -n4 go test $(TESTARGS) -timeout=60s -parallel=4
 
 # testacc runs acceptance tests
 testacc: fmtcheck generate
@@ -44,6 +42,20 @@ testacc: fmtcheck generate
 		exit 1; \
 	fi
 	TF_ACC=1 go test $(TEST) -v $(TESTARGS) -timeout 120m
+
+# e2etest runs the end-to-end tests against a generated Terraform binary
+# The TF_ACC here allows network access, but does not require any special
+# credentials since the e2etests use local-only providers such as "null".
+e2etest: generate
+	TF_ACC=1 go test -v ./command/e2etest
+
+test-compile: fmtcheck generate
+	@if [ "$(TEST)" = "./..." ]; then \
+		echo "ERROR: Set TEST to a specific package. For example,"; \
+		echo "  make test-compile TEST=./builtin/providers/aws"; \
+		exit 1; \
+	fi
+	go test -c $(TEST) $(TESTARGS)
 
 # testrace runs the race checker
 testrace: fmtcheck generate
@@ -57,27 +69,13 @@ cover:
 	go tool cover -html=coverage.out
 	rm coverage.out
 
-# vet runs the Go source code static analysis tool `vet` to find
-# any common errors.
-vet:
-	@go tool vet 2>/dev/null ; if [ $$? -eq 3 ]; then \
-		go get golang.org/x/tools/cmd/vet; \
-	fi
-	@echo "go tool vet $(VETARGS) ."
-	@go tool vet $(VETARGS) $$(ls -d */ | grep -v vendor) ; if [ $$? -eq 1 ]; then \
-		echo ""; \
-		echo "Vet found suspicious constructs. Please check the reported constructs"; \
-		echo "and fix them if necessary before submitting the code for review."; \
-		exit 1; \
-	fi
-
 # generate runs `go generate` to build the dynamically generated
 # source files.
 generate:
-	@which stringer ; if [ $$? -ne 0 ]; then \
+	@which stringer > /dev/null; if [ $$? -ne 0 ]; then \
 	  go get -u golang.org/x/tools/cmd/stringer; \
 	fi
-	go generate $$(go list ./... | grep -v /vendor/)
+	go generate ./...
 	@go fmt command/internal_plugin_list.go > /dev/null
 
 fmt:
@@ -86,4 +84,56 @@ fmt:
 fmtcheck:
 	@sh -c "'$(CURDIR)/scripts/gofmtcheck.sh'"
 
-.PHONY: bin default generate test vet fmt fmtcheck
+vendor-status:
+	@govendor status
+
+website:
+ifeq (,$(wildcard $(GOPATH)/src/$(WEBSITE_REPO)))
+	echo "$(WEBSITE_REPO) not found in your GOPATH (necessary for layouts and assets), get-ting..."
+	git clone https://$(WEBSITE_REPO) $(GOPATH)/src/$(WEBSITE_REPO)
+endif
+	$(eval WEBSITE_PATH := $(GOPATH)/src/$(WEBSITE_REPO))
+	@echo "==> Starting core website in Docker..."
+	@docker run \
+		--interactive \
+		--rm \
+		--tty \
+		--publish "4567:4567" \
+		--publish "35729:35729" \
+		--volume "$(shell pwd)/website:/website" \
+		--volume "$(shell pwd):/ext/terraform" \
+		--volume "$(WEBSITE_PATH)/content:/terraform-website" \
+		--volume "$(WEBSITE_PATH)/content/source/assets:/website/docs/assets" \
+		--volume "$(WEBSITE_PATH)/content/source/layouts:/website/docs/layouts" \
+		--workdir /terraform-website \
+		hashicorp/middleman-hashicorp:${VERSION}
+
+website-test:
+ifeq (,$(wildcard $(GOPATH)/src/$(WEBSITE_REPO)))
+	echo "$(WEBSITE_REPO) not found in your GOPATH (necessary for layouts and assets), get-ting..."
+	git clone https://$(WEBSITE_REPO) $(GOPATH)/src/$(WEBSITE_REPO)
+endif
+	$(eval WEBSITE_PATH := $(GOPATH)/src/$(WEBSITE_REPO))
+	@echo "==> Testing core website in Docker..."
+	-@docker stop "tf-website-core-temp"
+	@docker run \
+		--detach \
+		--rm \
+		--name "tf-website-core-temp" \
+		--publish "4567:4567" \
+		--volume "$(shell pwd)/website:/website" \
+		--volume "$(shell pwd):/ext/terraform" \
+		--volume "$(WEBSITE_PATH)/content:/terraform-website" \
+		--volume "$(WEBSITE_PATH)/content/source/assets:/website/docs/assets" \
+		--volume "$(WEBSITE_PATH)/content/source/layouts:/website/docs/layouts" \
+		--workdir /terraform-website \
+		hashicorp/middleman-hashicorp:${VERSION}
+	$(WEBSITE_PATH)/content/scripts/check-links.sh "http://127.0.0.1:4567" "/" "/docs/providers/*"
+	@docker stop "tf-website-core-temp"
+
+# disallow any parallelism (-j) for Make. This is necessary since some
+# commands during the build process create temporary files that collide
+# under parallel conditions.
+.NOTPARALLEL:
+
+.PHONY: bin cover default dev e2etest fmt fmtcheck generate plugin-dev quickdev test-compile test testacc testrace tools vendor-status website website-test

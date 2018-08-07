@@ -9,7 +9,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform/helper/copy"
+	"github.com/hashicorp/terraform/state"
 	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/version"
 	"github.com/mitchellh/cli"
 )
 
@@ -21,8 +24,8 @@ func TestRefresh(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -59,22 +62,71 @@ func TestRefresh(t *testing.T) {
 	}
 }
 
-func TestRefresh_badState(t *testing.T) {
+func TestRefresh_empty(t *testing.T) {
+	// Create a temporary working directory that is empty
+	td := tempDir(t)
+	copy.CopyDir(testFixturePath("refresh-empty"), td)
+	defer os.RemoveAll(td)
+	defer testChdir(t, td)()
+
 	p := testProvider()
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
+	p.RefreshFn = nil
+	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+
 	args := []string{
-		"-state", "i-should-not-exist-ever",
+		td,
+	}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+	}
+
+	if p.RefreshCalled {
+		t.Fatal("refresh should not be called")
+	}
+}
+
+func TestRefresh_lockedState(t *testing.T) {
+	state := testState()
+	statePath := testStateFile(t, state)
+
+	unlock, err := testLockState("./testdata", statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	p := testProvider()
+	ui := new(cli.MockUi)
+	c := &RefreshCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
+		},
+	}
+
+	p.RefreshFn = nil
+	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+
+	args := []string{
+		"-state", statePath,
 		testFixturePath("refresh"),
 	}
-	if code := c.Run(args); code != 1 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
+
+	if code := c.Run(args); code == 0 {
+		t.Fatal("expected error")
+	}
+
+	output := ui.ErrorWriter.String()
+	if !strings.Contains(output, "lock") {
+		t.Fatal("command output does not look like a lock error:", output)
 	}
 }
 
@@ -95,8 +147,8 @@ func TestRefresh_cwd(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -137,21 +189,17 @@ func TestRefresh_defaultState(t *testing.T) {
 
 	// Write the state file in a temporary directory with the
 	// default filename.
-	td, err := ioutil.TempDir("", "tf")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	statePath := filepath.Join(td, DefaultStateFilename)
+	statePath := testStateFile(t, originalState)
 
-	f, err := os.Create(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	localState := &state.LocalState{Path: statePath}
+	if err := localState.RefreshState(); err != nil {
+		t.Fatal(err)
 	}
-	err = terraform.WriteState(originalState, f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	s := localState.State()
+	if s == nil {
+		t.Fatal("empty test state")
 	}
+	serial := s.Serial
 
 	// Change to that directory
 	cwd, err := os.Getwd()
@@ -167,15 +215,16 @@ func TestRefresh_defaultState(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
 	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.RefreshReturn = newInstanceState("yes")
 
 	args := []string{
+		"-state", statePath,
 		testFixturePath("refresh"),
 	}
 	if code := c.Run(args); code != 0 {
@@ -186,33 +235,20 @@ func TestRefresh_defaultState(t *testing.T) {
 		t.Fatal("refresh should be called")
 	}
 
-	f, err = os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	newState := testStateRead(t, statePath)
 
 	actual := newState.RootModule().Resources["test_instance.foo"].Primary
 	expected := p.RefreshReturn
 	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
+		t.Logf("expected:\n%#v", expected)
+		t.Fatalf("bad:\n%#v", actual)
 	}
 
-	f, err = os.Open(statePath + DefaultBackupExtension)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	if newState.Serial <= serial {
+		t.Fatalf("serial not incremented during refresh. previous:%d, current:%d", serial, newState.Serial)
 	}
 
-	backupState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	backupState := testStateRead(t, statePath+DefaultBackupExtension)
 
 	actual = backupState.RootModule().Resources["test_instance.foo"].Primary
 	expected = originalState.RootModule().Resources["test_instance.foo"].Primary
@@ -239,8 +275,8 @@ func TestRefresh_futureState(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -282,8 +318,8 @@ func TestRefresh_pastState(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -319,7 +355,7 @@ func TestRefresh_pastState(t *testing.T) {
 		t.Fatalf("bad:\n\n%s", actual)
 	}
 
-	if newState.TFVersion != terraform.Version {
+	if newState.TFVersion != version.Version {
 		t.Fatalf("bad:\n\n%s", newState.TFVersion)
 	}
 }
@@ -329,7 +365,7 @@ func TestRefresh_outPath(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -341,13 +377,13 @@ func TestRefresh_outPath(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
 	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.RefreshReturn = newInstanceState("yes")
 
 	args := []string{
 		"-state", statePath,
@@ -416,8 +452,8 @@ func TestRefresh_var(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -446,8 +482,8 @@ func TestRefresh_varFile(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -481,8 +517,8 @@ func TestRefresh_varFileDefault(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -531,8 +567,8 @@ func TestRefresh_varsUnset(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -550,7 +586,7 @@ func TestRefresh_backup(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -559,7 +595,7 @@ func TestRefresh_backup(t *testing.T) {
 	os.Remove(outPath)
 
 	// Backup path
-	backupf, err := ioutil.TempFile("", "tf")
+	backupf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -571,13 +607,13 @@ func TestRefresh_backup(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
 	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.RefreshReturn = newInstanceState("yes")
 
 	args := []string{
 		"-state", statePath,
@@ -644,7 +680,7 @@ func TestRefresh_disableBackup(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -656,13 +692,13 @@ func TestRefresh_disableBackup(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
 	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.RefreshReturn = newInstanceState("yes")
 
 	args := []string{
 		"-state", statePath,
@@ -711,6 +747,10 @@ func TestRefresh_disableBackup(t *testing.T) {
 	if err == nil || !os.IsNotExist(err) {
 		t.Fatalf("backup should not exist")
 	}
+	_, err = os.Stat("-")
+	if err == nil || !os.IsNotExist(err) {
+		t.Fatalf("backup should not exist")
+	}
 }
 
 func TestRefresh_displaysOutputs(t *testing.T) {
@@ -721,8 +761,8 @@ func TestRefresh_displaysOutputs(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
@@ -742,6 +782,20 @@ func TestRefresh_displaysOutputs(t *testing.T) {
 	}
 }
 
+// When creating an InstaneState for direct comparison to one contained in
+// terraform.State, all fields must be initialized (duplicating the
+// InstanceState.init() method)
+func newInstanceState(id string) *terraform.InstanceState {
+	return &terraform.InstanceState{
+		ID:         id,
+		Attributes: make(map[string]string),
+		Ephemeral: terraform.EphemeralState{
+			ConnInfo: make(map[string]string),
+		},
+		Meta: make(map[string]interface{}),
+	}
+}
+
 const refreshVarFile = `
 foo = "bar"
 `
@@ -749,8 +803,10 @@ foo = "bar"
 const testRefreshStr = `
 test_instance.foo:
   ID = yes
+  provider = provider.test
 `
 const testRefreshCwdStr = `
 test_instance.foo:
   ID = yes
+  provider = provider.test
 `

@@ -4,13 +4,96 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/config"
+	"github.com/hashicorp/terraform/config/configschema"
 	"github.com/hashicorp/terraform/terraform"
 )
 
 func TestProvider_impl(t *testing.T) {
 	var _ terraform.ResourceProvider = new(Provider)
+}
+
+func TestProviderGetSchema(t *testing.T) {
+	// This functionality is already broadly tested in core_schema_test.go,
+	// so this is just to ensure that the call passes through correctly.
+	p := &Provider{
+		Schema: map[string]*Schema{
+			"bar": {
+				Type:     TypeString,
+				Required: true,
+			},
+		},
+		ResourcesMap: map[string]*Resource{
+			"foo": &Resource{
+				Schema: map[string]*Schema{
+					"bar": {
+						Type:     TypeString,
+						Required: true,
+					},
+				},
+			},
+		},
+		DataSourcesMap: map[string]*Resource{
+			"baz": &Resource{
+				Schema: map[string]*Schema{
+					"bur": {
+						Type:     TypeString,
+						Required: true,
+					},
+				},
+			},
+		},
+	}
+
+	want := &terraform.ProviderSchema{
+		Provider: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"bar": &configschema.Attribute{
+					Type:     cty.String,
+					Required: true,
+				},
+			},
+			BlockTypes: map[string]*configschema.NestedBlock{},
+		},
+		ResourceTypes: map[string]*configschema.Block{
+			"foo": &configschema.Block{
+				Attributes: map[string]*configschema.Attribute{
+					"bar": &configschema.Attribute{
+						Type:     cty.String,
+						Required: true,
+					},
+				},
+				BlockTypes: map[string]*configschema.NestedBlock{},
+			},
+		},
+		DataSources: map[string]*configschema.Block{
+			"baz": &configschema.Block{
+				Attributes: map[string]*configschema.Attribute{
+					"bur": &configschema.Attribute{
+						Type:     cty.String,
+						Required: true,
+					},
+				},
+				BlockTypes: map[string]*configschema.NestedBlock{},
+			},
+		},
+	}
+	got, err := p.GetSchema(&terraform.ProviderSchemaRequest{
+		ResourceTypes: []string{"foo", "bar"},
+		DataSources:   []string{"baz", "bar"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error %s", err)
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("wrong result\ngot: %swant: %s", spew.Sdump(got), spew.Sdump(want))
+	}
 }
 
 func TestProviderConfigure(t *testing.T) {
@@ -103,8 +186,8 @@ func TestProviderResources(t *testing.T) {
 				},
 			},
 			Result: []terraform.ResourceType{
-				terraform.ResourceType{Name: "bar"},
-				terraform.ResourceType{Name: "foo"},
+				terraform.ResourceType{Name: "bar", SchemaAvailable: true},
+				terraform.ResourceType{Name: "foo", SchemaAvailable: true},
 			},
 		},
 
@@ -117,9 +200,9 @@ func TestProviderResources(t *testing.T) {
 				},
 			},
 			Result: []terraform.ResourceType{
-				terraform.ResourceType{Name: "bar", Importable: true},
-				terraform.ResourceType{Name: "baz"},
-				terraform.ResourceType{Name: "foo"},
+				terraform.ResourceType{Name: "bar", Importable: true, SchemaAvailable: true},
+				terraform.ResourceType{Name: "baz", SchemaAvailable: true},
+				terraform.ResourceType{Name: "foo", SchemaAvailable: true},
 			},
 		},
 	}
@@ -150,8 +233,8 @@ func TestProviderDataSources(t *testing.T) {
 				},
 			},
 			Result: []terraform.DataSource{
-				terraform.DataSource{Name: "bar"},
-				terraform.DataSource{Name: "foo"},
+				terraform.DataSource{Name: "bar", SchemaAvailable: true},
+				terraform.DataSource{Name: "foo", SchemaAvailable: true},
 			},
 		},
 	}
@@ -326,5 +409,144 @@ func TestProviderMeta(t *testing.T) {
 	p.SetMeta(42)
 	if v := p.Meta(); !reflect.DeepEqual(v, expected) {
 		t.Fatalf("bad: %#v", v)
+	}
+}
+
+func TestProviderStop(t *testing.T) {
+	var p Provider
+
+	if p.Stopped() {
+		t.Fatal("should not be stopped")
+	}
+
+	// Verify stopch blocks
+	ch := p.StopContext().Done()
+	select {
+	case <-ch:
+		t.Fatal("should not be stopped")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	// Stop it
+	if err := p.Stop(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Verify
+	if !p.Stopped() {
+		t.Fatal("should be stopped")
+	}
+
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Millisecond):
+		t.Fatal("should be stopped")
+	}
+}
+
+func TestProviderStop_stopFirst(t *testing.T) {
+	var p Provider
+
+	// Stop it
+	if err := p.Stop(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Verify
+	if !p.Stopped() {
+		t.Fatal("should be stopped")
+	}
+
+	select {
+	case <-p.StopContext().Done():
+	case <-time.After(10 * time.Millisecond):
+		t.Fatal("should be stopped")
+	}
+}
+
+func TestProviderReset(t *testing.T) {
+	var p Provider
+	stopCtx := p.StopContext()
+	p.MetaReset = func() error {
+		stopCtx = p.StopContext()
+		return nil
+	}
+
+	// cancel the current context
+	p.Stop()
+
+	if err := p.TestReset(); err != nil {
+		t.Fatal(err)
+	}
+
+	// the first context should have been replaced
+	if err := stopCtx.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	// we should not get a canceled context here either
+	if err := p.StopContext().Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProvider_InternalValidate(t *testing.T) {
+	cases := []struct {
+		P           *Provider
+		ExpectedErr error
+	}{
+		{
+			P: &Provider{
+				Schema: map[string]*Schema{
+					"foo": {
+						Type:     TypeBool,
+						Optional: true,
+					},
+				},
+			},
+			ExpectedErr: nil,
+		},
+		{ // Reserved resource fields should be allowed in provider block
+			P: &Provider{
+				Schema: map[string]*Schema{
+					"provisioner": {
+						Type:     TypeString,
+						Optional: true,
+					},
+					"count": {
+						Type:     TypeInt,
+						Optional: true,
+					},
+				},
+			},
+			ExpectedErr: nil,
+		},
+		{ // Reserved provider fields should not be allowed
+			P: &Provider{
+				Schema: map[string]*Schema{
+					"alias": {
+						Type:     TypeString,
+						Optional: true,
+					},
+				},
+			},
+			ExpectedErr: fmt.Errorf("%s is a reserved field name for a provider", "alias"),
+		},
+	}
+
+	for i, tc := range cases {
+		err := tc.P.InternalValidate()
+		if tc.ExpectedErr == nil {
+			if err != nil {
+				t.Fatalf("%d: Error returned (expected no error): %s", i, err)
+			}
+			continue
+		}
+		if tc.ExpectedErr != nil && err == nil {
+			t.Fatalf("%d: Expected error (%s), but no error returned", i, tc.ExpectedErr)
+		}
+		if err.Error() != tc.ExpectedErr.Error() {
+			t.Fatalf("%d: Errors don't match. Expected: %#v Given: %#v", i, tc.ExpectedErr, err)
+		}
 	}
 }

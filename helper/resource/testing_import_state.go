@@ -16,14 +16,27 @@ func testStepImportState(
 	state *terraform.State,
 	step TestStep) (*terraform.State, error) {
 	// Determine the ID to import
-	importId := step.ImportStateId
-	if importId == "" {
+	var importId string
+	switch {
+	case step.ImportStateIdFunc != nil:
+		var err error
+		importId, err = step.ImportStateIdFunc(state)
+		if err != nil {
+			return state, err
+		}
+	case step.ImportStateId != "":
+		importId = step.ImportStateId
+	default:
 		resource, err := testResource(step, state)
 		if err != nil {
 			return state, err
 		}
-
 		importId = resource.Primary.ID
+	}
+
+	importPrefix := step.ImportStateIdPrefix
+	if importPrefix != "" {
+		importId = fmt.Sprintf("%s%s", importPrefix, importId)
 	}
 
 	// Setup the context. We initialize with an empty state. We use the
@@ -78,7 +91,7 @@ func testStepImportState(
 			// Find the existing resource
 			var oldR *terraform.ResourceState
 			for _, r2 := range old {
-				if r2.Primary != nil && r2.Primary.ID == r.Primary.ID {
+				if r2.Primary != nil && r2.Primary.ID == r.Primary.ID && r2.Type == r.Type {
 					oldR = r2
 					break
 				}
@@ -90,8 +103,14 @@ func testStepImportState(
 			}
 
 			// Compare their attributes
-			actual := r.Primary.Attributes
-			expected := oldR.Primary.Attributes
+			actual := make(map[string]string)
+			for k, v := range r.Primary.Attributes {
+				actual[k] = v
+			}
+			expected := make(map[string]string)
+			for k, v := range oldR.Primary.Attributes {
+				expected[k] = v
+			}
 
 			// Remove fields we're ignoring
 			for _, v := range step.ImportStateVerifyIgnore {

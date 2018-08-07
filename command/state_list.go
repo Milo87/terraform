@@ -12,22 +12,41 @@ import (
 // within a state file.
 type StateListCommand struct {
 	Meta
+	StateMeta
 }
 
 func (c *StateListCommand) Run(args []string) int {
-	args = c.Meta.process(args, true)
+	args, err := c.Meta.process(args, true)
+	if err != nil {
+		return 1
+	}
 
 	cmdFlags := c.Meta.flagSet("state list")
 	cmdFlags.StringVar(&c.Meta.statePath, "state", DefaultStateFilename, "path")
+	lookupId := cmdFlags.String("id", "", "Restrict output to paths with a resource having the specified ID.")
 	if err := cmdFlags.Parse(args); err != nil {
 		return cli.RunResultHelp
 	}
 	args = cmdFlags.Args()
 
-	state, err := c.State()
+	// Load the backend
+	b, err := c.Backend(nil)
 	if err != nil {
-		c.Ui.Error(fmt.Sprintf(errStateLoadingState, err))
-		return cli.RunResultHelp
+		c.Ui.Error(fmt.Sprintf("Failed to load backend: %s", err))
+		return 1
+	}
+
+	env := c.Workspace()
+	// Get the state
+	state, err := b.State(env)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+		return 1
+	}
+
+	if err := state.RefreshState(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to load state: %s", err))
+		return 1
 	}
 
 	stateReal := state.State()
@@ -44,8 +63,10 @@ func (c *StateListCommand) Run(args []string) int {
 	}
 
 	for _, result := range results {
-		if _, ok := result.Value.(*terraform.InstanceState); ok {
-			c.Ui.Output(result.Address)
+		if i, ok := result.Value.(*terraform.InstanceState); ok {
+			if *lookupId == "" || i.ID == *lookupId {
+				c.Ui.Output(result.Address)
+			}
 		}
 	}
 
@@ -75,6 +96,8 @@ Options:
   -state=statefile    Path to a Terraform state file to use to look
                       up Terraform-managed resources. By default it will
                       use the state "terraform.tfstate" if it exists.
+
+  -id=ID              Restricts the output to objects whose id is ID.
 
 `
 	return strings.TrimSpace(helpText)

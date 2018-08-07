@@ -1,6 +1,7 @@
 package terraform
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"sync"
@@ -15,12 +16,18 @@ func TestContext2Input(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
-			"foo":            "us-west-2",
-			"amis.us-east-1": "override",
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
+			"foo": "us-west-2",
+			"amis": []map[string]interface{}{
+				map[string]interface{}{
+					"us-east-1": "override",
+				},
+			},
 		},
 		UIInput: input,
 	})
@@ -49,6 +56,29 @@ func TestContext2Input(t *testing.T) {
 	}
 }
 
+func TestContext2Input_moduleComputedOutputElement(t *testing.T) {
+	m := testModule(t, "input-module-computed-output-element")
+	p := testProvider("aws")
+	p.ApplyFn = testApplyFn
+	p.DiffFn = testDiffFn
+	ctx := testContext2(t, &ContextOpts{
+		Module: m,
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+	})
+
+	p.InputFn = func(i UIInput, c *ResourceConfig) (*ResourceConfig, error) {
+		return c, nil
+	}
+
+	if err := ctx.Input(InputModeStd); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+}
+
 func TestContext2Input_badVarDefault(t *testing.T) {
 	m := testModule(t, "input-bad-var-default")
 	p := testProvider("aws")
@@ -56,9 +86,11 @@ func TestContext2Input_badVarDefault(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 	})
 
 	p.InputFn = func(i UIInput, c *ResourceConfig) (*ResourceConfig, error) {
@@ -78,9 +110,11 @@ func TestContext2Input_provider(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 	})
 
 	var actual interface{}
@@ -120,9 +154,11 @@ func TestContext2Input_providerMulti(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 	})
 
 	var actual []interface{}
@@ -166,23 +202,34 @@ func TestContext2Input_providerOnce(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 	})
 
 	count := 0
 	p.InputFn = func(i UIInput, c *ResourceConfig) (*ResourceConfig, error) {
 		count++
-		return nil, nil
+		_, set := c.Config["from_input"]
+
+		if count == 1 {
+			if set {
+				return nil, errors.New("from_input should not be set")
+			}
+			c.Config["from_input"] = "x"
+		}
+
+		if count > 1 && !set {
+			return nil, errors.New("from_input should be set")
+		}
+
+		return c, nil
 	}
 
 	if err := ctx.Input(InputModeStd); err != nil {
 		t.Fatalf("err: %s", err)
-	}
-
-	if count != 1 {
-		t.Fatalf("should only be called once: %d", count)
 	}
 }
 
@@ -194,9 +241,11 @@ func TestContext2Input_providerId(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 		UIInput: input,
 	})
 
@@ -244,10 +293,12 @@ func TestContext2Input_providerOnly(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
 			"foo": "us-west-2",
 		},
 		UIInput: input,
@@ -299,10 +350,12 @@ func TestContext2Input_providerVars(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
 			"foo": "bar",
 		},
 		UIInput: input,
@@ -347,9 +400,11 @@ func TestContext2Input_providerVarsModuleInherit(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
 		UIInput: input,
 	})
 
@@ -376,10 +431,12 @@ func TestContext2Input_varOnly(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
 			"foo": "us-west-2",
 		},
 		UIInput: input,
@@ -431,10 +488,12 @@ func TestContext2Input_varOnlyUnset(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
 			"foo": "foovalue",
 		},
 		UIInput: input,
@@ -473,10 +532,12 @@ func TestContext2Input_varWithDefault(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{},
 		UIInput:   input,
 	})
 
@@ -503,6 +564,7 @@ func TestContext2Input_varWithDefault(t *testing.T) {
 	expectedStr := strings.TrimSpace(`
 aws_instance.foo:
   ID = foo
+  provider = provider.aws
   foo = 123
   type = aws_instance
 	`)
@@ -519,10 +581,12 @@ func TestContext2Input_varPartiallyComputed(t *testing.T) {
 	p.DiffFn = testDiffFn
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"aws": testProviderFuncFixed(p),
-		},
-		Variables: map[string]string{
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{
 			"foo": "foovalue",
 		},
 		UIInput: input,
@@ -582,13 +646,141 @@ func TestContext2Input_interpolateVar(t *testing.T) {
 
 	ctx := testContext2(t, &ContextOpts{
 		Module: m,
-		Providers: map[string]ResourceProviderFactory{
-			"template": testProviderFuncFixed(p),
-		},
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"template": testProviderFuncFixed(p),
+			},
+		),
 		UIInput: input,
 	})
 
 	if err := ctx.Input(InputModeStd); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+func TestContext2Input_hcl(t *testing.T) {
+	input := new(MockUIInput)
+	m := testModule(t, "input-hcl")
+	p := testProvider("hcl")
+	p.ApplyFn = testApplyFn
+	p.DiffFn = testDiffFn
+	ctx := testContext2(t, &ContextOpts{
+		Module: m,
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"hcl": testProviderFuncFixed(p),
+			},
+		),
+		Variables: map[string]interface{}{},
+		UIInput:   input,
+	})
+
+	input.InputReturnMap = map[string]string{
+		"var.listed": `["a", "b"]`,
+		"var.mapped": `{x = "y", w = "z"}`,
+	}
+
+	if err := ctx.Input(InputModeVar | InputModeVarUnset); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if _, err := ctx.Plan(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	state, err := ctx.Apply()
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	actualStr := strings.TrimSpace(state.String())
+	expectedStr := strings.TrimSpace(testTerraformInputHCL)
+	if actualStr != expectedStr {
+		t.Logf("expected: \n%s", expectedStr)
+		t.Fatalf("bad: \n%s", actualStr)
+	}
+}
+
+// adding a list interpolation in fails to interpolate the count variable
+func TestContext2Input_submoduleTriggersInvalidCount(t *testing.T) {
+	input := new(MockUIInput)
+	m := testModule(t, "input-submodule-count")
+	p := testProvider("aws")
+	p.ApplyFn = testApplyFn
+	p.DiffFn = testDiffFn
+	ctx := testContext2(t, &ContextOpts{
+		Module: m,
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"aws": testProviderFuncFixed(p),
+			},
+		),
+		UIInput: input,
+	})
+
+	p.InputFn = func(i UIInput, c *ResourceConfig) (*ResourceConfig, error) {
+		return c, nil
+	}
+	p.ConfigureFn = func(c *ResourceConfig) error {
+		return nil
+	}
+
+	if err := ctx.Input(InputModeStd); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+}
+
+// In this case, a module variable can't be resolved from a data source until
+// it's refreshed, but it can't be refreshed during Input.
+func TestContext2Input_dataSourceRequiresRefresh(t *testing.T) {
+	input := new(MockUIInput)
+	p := testProvider("null")
+	m := testModule(t, "input-module-data-vars")
+
+	p.ReadDataDiffFn = testDataDiffFn
+
+	state := &State{
+		Modules: []*ModuleState{
+			&ModuleState{
+				Path: rootModulePath,
+				Resources: map[string]*ResourceState{
+					"data.null_data_source.bar": &ResourceState{
+						Type: "null_data_source",
+						Primary: &InstanceState{
+							ID: "-",
+							Attributes: map[string]string{
+								"foo.#": "1",
+								"foo.0": "a",
+								// foo.1 exists in the data source, but needs to be refreshed.
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ctx := testContext2(t, &ContextOpts{
+		Module: m,
+		ProviderResolver: ResourceProviderResolverFixed(
+			map[string]ResourceProviderFactory{
+				"null": testProviderFuncFixed(p),
+			},
+		),
+		State:   state,
+		UIInput: input,
+	})
+
+	if err := ctx.Input(InputModeStd); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// ensure that plan works after Refresh
+	if _, err := ctx.Refresh(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if _, err := ctx.Plan(); err != nil {
 		t.Fatalf("err: %s", err)
 	}
 }

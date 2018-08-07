@@ -5,7 +5,88 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/go-version"
+	"github.com/hashicorp/terraform/flatmap"
+	tfversion "github.com/hashicorp/terraform/version"
 )
+
+func TestNewContextRequiredVersion(t *testing.T) {
+	cases := []struct {
+		Name    string
+		Module  string
+		Version string
+		Value   string
+		Err     bool
+	}{
+		{
+			"no requirement",
+			"",
+			"0.1.0",
+			"",
+			false,
+		},
+
+		{
+			"doesn't match",
+			"",
+			"0.1.0",
+			"> 0.6.0",
+			true,
+		},
+
+		{
+			"matches",
+			"",
+			"0.7.0",
+			"> 0.6.0",
+			false,
+		},
+
+		{
+			"module matches",
+			"context-required-version-module",
+			"0.5.0",
+			"",
+			false,
+		},
+
+		{
+			"module doesn't match",
+			"context-required-version-module",
+			"0.4.0",
+			"",
+			true,
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(fmt.Sprintf("%d-%s", i, tc.Name), func(t *testing.T) {
+			// Reset the version for the tests
+			old := tfversion.SemVer
+			tfversion.SemVer = version.Must(version.NewVersion(tc.Version))
+			defer func() { tfversion.SemVer = old }()
+
+			name := "context-required-version"
+			if tc.Module != "" {
+				name = tc.Module
+			}
+			mod := testModule(t, name)
+			if tc.Value != "" {
+				mod.Config().Terraform.RequiredVersion = tc.Value
+			}
+			_, err := NewContext(&ContextOpts{
+				Module: mod,
+			})
+			if (err != nil) != tc.Err {
+				t.Fatalf("err: %s", err)
+			}
+			if err != nil {
+				return
+			}
+		})
+	}
+}
 
 func TestNewContextState(t *testing.T) {
 	cases := map[string]struct {
@@ -28,7 +109,7 @@ func TestNewContextState(t *testing.T) {
 
 		"equal TFVersion": {
 			&ContextOpts{
-				State: &State{TFVersion: Version},
+				State: &State{TFVersion: tfversion.Version},
 			},
 			false,
 		},
@@ -59,19 +140,35 @@ func TestNewContextState(t *testing.T) {
 		}
 
 		// Version should always be set to our current
-		if ctx.state.TFVersion != Version {
+		if ctx.state.TFVersion != tfversion.Version {
 			t.Fatalf("%s: state not set to current version", k)
 		}
 	}
 }
 
 func testContext2(t *testing.T, opts *ContextOpts) *Context {
+	t.Helper()
+	// Enable the shadow graph
+	opts.Shadow = true
+
 	ctx, err := NewContext(opts)
 	if err != nil {
-		t.Fatalf("err: %s", err)
+		t.Fatalf("failed to create test context\n\n%s\n", err)
 	}
 
 	return ctx
+}
+
+func testDataApplyFn(
+	info *InstanceInfo,
+	d *InstanceDiff) (*InstanceState, error) {
+	return testApplyFn(info, new(InstanceState), d)
+}
+
+func testDataDiffFn(
+	info *InstanceInfo,
+	c *ResourceConfig) (*InstanceDiff, error) {
+	return testDiffFn(info, new(InstanceState), c)
 }
 
 func testApplyFn(
@@ -115,10 +212,6 @@ func testDiffFn(
 	}
 
 	for k, v := range c.Raw {
-		if _, ok := v.(string); !ok {
-			continue
-		}
-
 		// Ignore __-prefixed keys since they're used for magic
 		if k[0] == '_' && k[1] == '_' {
 			continue
@@ -164,18 +257,20 @@ func testDiffFn(
 			v = c.Config[k]
 		}
 
-		attrDiff := &ResourceAttrDiff{
-			Old: "",
-			New: v.(string),
-		}
+		for k, attrDiff := range testFlatAttrDiffs(k, v) {
+			if k == "require_new" {
+				attrDiff.RequiresNew = true
+			}
+			if _, ok := c.Raw["__"+k+"_requires_new"]; ok {
+				attrDiff.RequiresNew = true
+			}
 
-		if k == "require_new" {
-			attrDiff.RequiresNew = true
+			if attr, ok := s.Attributes[k]; ok {
+				attrDiff.Old = attr
+			}
+
+			diff.Attributes[k] = attrDiff
 		}
-		if _, ok := c.Raw["__"+k+"_requires_new"]; ok {
-			attrDiff.RequiresNew = true
-		}
-		diff.Attributes[k] = attrDiff
 	}
 
 	for _, k := range c.ComputedKeys {
@@ -213,6 +308,39 @@ func testDiffFn(
 	return diff, nil
 }
 
+// generate ResourceAttrDiffs for nested data structures in tests
+func testFlatAttrDiffs(k string, i interface{}) map[string]*ResourceAttrDiff {
+	diffs := make(map[string]*ResourceAttrDiff)
+	// check for strings and empty containers first
+	switch t := i.(type) {
+	case string:
+		diffs[k] = &ResourceAttrDiff{New: t}
+		return diffs
+	case map[string]interface{}:
+		if len(t) == 0 {
+			diffs[k] = &ResourceAttrDiff{New: ""}
+			return diffs
+		}
+	case []interface{}:
+		if len(t) == 0 {
+			diffs[k] = &ResourceAttrDiff{New: ""}
+			return diffs
+		}
+	}
+
+	flat := flatmap.Flatten(map[string]interface{}{k: i})
+
+	for k, v := range flat {
+		attrDiff := &ResourceAttrDiff{
+			Old: "",
+			New: v,
+		}
+		diffs[k] = attrDiff
+	}
+
+	return diffs
+}
+
 func testProvider(prefix string) *MockResourceProvider {
 	p := new(MockResourceProvider)
 	p.RefreshFn = func(info *InstanceInfo, s *InstanceState) (*InstanceState, error) {
@@ -233,6 +361,7 @@ func testProvisioner() *MockResourceProvisioner {
 }
 
 func checkStateString(t *testing.T, state *State, expected string) {
+	t.Helper()
 	actual := strings.TrimSpace(state.String())
 	expected = strings.TrimSpace(expected)
 
@@ -246,6 +375,9 @@ func resourceState(resourceType, resourceID string) *ResourceState {
 		Type: resourceType,
 		Primary: &InstanceState{
 			ID: resourceID,
+			Attributes: map[string]string{
+				"id": resourceID,
+			},
 		},
 	}
 }
@@ -253,6 +385,7 @@ func resourceState(resourceType, resourceID string) *ResourceState {
 // Test helper that gives a function 3 seconds to finish, assumes deadlock and
 // fails test if it does not.
 func testCheckDeadlock(t *testing.T, f func()) {
+	t.Helper()
 	timeout := make(chan bool, 1)
 	done := make(chan bool, 1)
 	go func() {
@@ -286,15 +419,18 @@ root
 const testContextRefreshModuleStr = `
 aws_instance.web: (tainted)
   ID = bar
+  provider = provider.aws
 
 module.child:
   aws_instance.web:
     ID = new
+    provider = provider.aws
 `
 
 const testContextRefreshOutputStr = `
 aws_instance.web:
   ID = foo
+  provider = provider.aws
   foo = bar
 
 Outputs:
@@ -309,4 +445,5 @@ const testContextRefreshOutputPartialStr = `
 const testContextRefreshTaintedStr = `
 aws_instance.web: (tainted)
   ID = foo
+  provider = provider.aws
 `

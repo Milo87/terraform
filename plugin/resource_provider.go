@@ -28,6 +28,37 @@ type ResourceProvider struct {
 	Client *rpc.Client
 }
 
+func (p *ResourceProvider) Stop() error {
+	var resp ResourceProviderStopResponse
+	err := p.Client.Call("Plugin.Stop", new(interface{}), &resp)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		err = resp.Error
+	}
+
+	return err
+}
+
+func (p *ResourceProvider) GetSchema(req *terraform.ProviderSchemaRequest) (*terraform.ProviderSchema, error) {
+	var result ResourceProviderGetSchemaResponse
+	args := &ResourceProviderGetSchemaArgs{
+		Req: req,
+	}
+
+	err := p.Client.Call("Plugin.GetSchema", args, &result)
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Error != nil {
+		err = result.Error
+	}
+
+	return result.Schema, err
+}
+
 func (p *ResourceProvider) Input(
 	input terraform.UIInput,
 	c *terraform.ResourceConfig) (*terraform.ResourceConfig, error) {
@@ -295,6 +326,19 @@ type ResourceProviderServer struct {
 	Provider terraform.ResourceProvider
 }
 
+type ResourceProviderStopResponse struct {
+	Error *plugin.BasicError
+}
+
+type ResourceProviderGetSchemaArgs struct {
+	Req *terraform.ProviderSchemaRequest
+}
+
+type ResourceProviderGetSchemaResponse struct {
+	Schema *terraform.ProviderSchema
+	Error  *plugin.BasicError
+}
+
 type ResourceProviderConfigureResponse struct {
 	Error *plugin.BasicError
 }
@@ -388,6 +432,29 @@ type ResourceProviderValidateResourceArgs struct {
 type ResourceProviderValidateResourceResponse struct {
 	Warnings []string
 	Errors   []*plugin.BasicError
+}
+
+func (s *ResourceProviderServer) Stop(
+	_ interface{},
+	reply *ResourceProviderStopResponse) error {
+	err := s.Provider.Stop()
+	*reply = ResourceProviderStopResponse{
+		Error: plugin.NewBasicError(err),
+	}
+
+	return nil
+}
+
+func (s *ResourceProviderServer) GetSchema(
+	args *ResourceProviderGetSchemaArgs,
+	result *ResourceProviderGetSchemaResponse,
+) error {
+	schema, err := s.Provider.GetSchema(args.Req)
+	result.Schema = schema
+	if err != nil {
+		result.Error = plugin.NewBasicError(err)
+	}
+	return nil
 }
 
 func (s *ResourceProviderServer) Input(

@@ -8,6 +8,10 @@ import (
 	"testing"
 )
 
+func TestErrNoConfigsFound_impl(t *testing.T) {
+	var _ error = new(ErrNoConfigsFound)
+}
+
 func TestIsEmptyDir(t *testing.T) {
 	val, err := IsEmptyDir(fixtureDir)
 	if err != nil {
@@ -45,6 +49,15 @@ func TestLoadFile_badType(t *testing.T) {
 	}
 }
 
+func TestLoadFile_gitCrypt(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "git-crypt.tf"))
+	if err == nil {
+		t.Fatal("should have error")
+	}
+
+	t.Logf("err: %s", err)
+}
+
 func TestLoadFile_lifecycleKeyCheck(t *testing.T) {
 	_, err := LoadFile(filepath.Join(fixtureDir, "lifecycle_cbd_typo.tf"))
 	if err == nil {
@@ -52,6 +65,13 @@ func TestLoadFile_lifecycleKeyCheck(t *testing.T) {
 	}
 
 	t.Logf("err: %s", err)
+}
+
+func TestLoadFile_varInvalidKey(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "var-invalid-key.tf"))
+	if err == nil {
+		t.Fatal("should have error")
+	}
 }
 
 func TestLoadFile_resourceArityMistake(t *testing.T) {
@@ -62,6 +82,13 @@ func TestLoadFile_resourceArityMistake(t *testing.T) {
 	expected := "Error loading test-fixtures/resource-arity-mistake.tf: position 2:10: resource must be followed by exactly two strings, a type and a name"
 	if err.Error() != expected {
 		t.Fatalf("expected:\n%s\ngot:\n%s", expected, err)
+	}
+}
+
+func TestLoadFile_resourceMultiLifecycle(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "resource-multi-lifecycle.tf"))
+	if err == nil {
+		t.Fatal("should have error")
 	}
 }
 
@@ -132,22 +159,13 @@ func TestLoadFileHeredoc(t *testing.T) {
 }
 
 func TestLoadFileEscapedQuotes(t *testing.T) {
-	c, err := LoadFile(filepath.Join(fixtureDir, "escapedquotes.tf"))
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	_, err := LoadFile(filepath.Join(fixtureDir, "escapedquotes.tf"))
+	if err == nil {
+		t.Fatalf("expected syntax error as escaped quotes are no longer supported")
 	}
 
-	if c == nil {
-		t.Fatal("config should not be nil")
-	}
-
-	if c.Dir != "" {
-		t.Fatalf("bad: %#v", c.Dir)
-	}
-
-	actual := resourcesStr(c.Resources)
-	if actual != strings.TrimSpace(escapedquotesResourcesStr) {
-		t.Fatalf("bad:\n%s", actual)
+	if !strings.Contains(err.Error(), "parse error") {
+		t.Fatalf("expected \"syntax error\", got: %s", err)
 	}
 }
 
@@ -162,12 +180,17 @@ func TestLoadFileBasic(t *testing.T) {
 	}
 
 	if c.Dir != "" {
-		t.Fatalf("bad: %#v", c.Dir)
+		t.Fatalf("wrong dir %#v; want %#v", c.Dir, "")
+	}
+
+	expectedTF := &Terraform{RequiredVersion: "foo"}
+	if !reflect.DeepEqual(c.Terraform, expectedTF) {
+		t.Fatalf("wrong terraform block %#v; want %#v", c.Terraform, expectedTF)
 	}
 
 	expectedAtlas := &AtlasConfig{Name: "mitchellh/foo"}
 	if !reflect.DeepEqual(c.Atlas, expectedAtlas) {
-		t.Fatalf("bad: %#v", c.Atlas)
+		t.Fatalf("wrong atlas config %#v; want %#v", c.Atlas, expectedAtlas)
 	}
 
 	actual := variablesStr(c.Variables)
@@ -183,6 +206,10 @@ func TestLoadFileBasic(t *testing.T) {
 	actual = resourcesStr(c.Resources)
 	if actual != strings.TrimSpace(basicResourcesStr) {
 		t.Fatalf("bad:\n%s", actual)
+	}
+
+	if actual, want := localsStr(c.Locals), strings.TrimSpace(basicLocalsStr); actual != want {
+		t.Fatalf("wrong locals:\n%s\nwant:\n%s", actual, want)
 	}
 
 	actual = outputsStr(c.Outputs)
@@ -265,6 +292,10 @@ func TestLoadFileBasic_json(t *testing.T) {
 		t.Fatalf("bad:\n%s", actual)
 	}
 
+	if actual, want := localsStr(c.Locals), strings.TrimSpace(basicLocalsStr); actual != want {
+		t.Fatalf("wrong locals:\n%s\nwant:\n%s", actual, want)
+	}
+
 	actual = outputsStr(c.Outputs)
 	if actual != strings.TrimSpace(basicOutputsStr) {
 		t.Fatalf("bad:\n%s", actual)
@@ -288,6 +319,126 @@ func TestLoadFileBasic_modules(t *testing.T) {
 	actual := modulesStr(c.Modules)
 	if actual != strings.TrimSpace(modulesModulesStr) {
 		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
+func TestLoadFile_unnamedModule(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "module-unnamed.tf"))
+	if err == nil {
+		t.Fatalf("bad: expected error")
+	}
+
+	errorStr := err.Error()
+	if !strings.Contains(errorStr, `"module" must be followed`) {
+		t.Fatalf("bad: expected error has wrong text: %s", errorStr)
+	}
+}
+
+func TestLoadFile_outputDependsOn(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "output-depends-on.tf"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	if c.Dir != "" {
+		t.Fatalf("bad: %#v", c.Dir)
+	}
+
+	actual := outputsStr(c.Outputs)
+	if actual != strings.TrimSpace(outputDependsOnStr) {
+		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
+func TestLoadFile_terraformBackend(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "terraform-backend.tf"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	if c.Dir != "" {
+		t.Fatalf("bad: %#v", c.Dir)
+	}
+
+	{
+		actual := terraformStr(c.Terraform)
+		expected := strings.TrimSpace(`
+backend (s3)
+  foo`)
+		if actual != expected {
+			t.Fatalf("bad:\n%s", actual)
+		}
+	}
+}
+
+func TestLoadFile_terraformBackendJSON(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "terraform-backend.tf.json"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	if c.Dir != "" {
+		t.Fatalf("bad: %#v", c.Dir)
+	}
+
+	{
+		actual := terraformStr(c.Terraform)
+		expected := strings.TrimSpace(`
+backend (s3)
+  foo`)
+		if actual != expected {
+			t.Fatalf("bad:\n%s", actual)
+		}
+	}
+}
+
+// test that the alternate, more obvious JSON format also decodes properly
+func TestLoadFile_terraformBackendJSON2(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "terraform-backend-2.tf.json"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	if c.Dir != "" {
+		t.Fatalf("bad: %#v", c.Dir)
+	}
+
+	{
+		actual := terraformStr(c.Terraform)
+		expected := strings.TrimSpace(`
+backend (s3)
+  foo`)
+		if actual != expected {
+			t.Fatalf("bad:\n%s", actual)
+		}
+	}
+}
+
+func TestLoadFile_terraformBackendMulti(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "terraform-backend-multi.tf"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	errorStr := err.Error()
+	if !strings.Contains(errorStr, "only one 'backend'") {
+		t.Fatalf("bad: expected error has wrong text: %s", errorStr)
 	}
 }
 
@@ -332,6 +483,69 @@ func TestLoadJSONBasic(t *testing.T) {
 
 	actual = outputsStr(c.Outputs)
 	if actual != strings.TrimSpace(basicOutputsStr) {
+		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
+func TestLoadJSONAmbiguous(t *testing.T) {
+	js := `
+{
+  "variable": {
+    "first": {
+      "default": {
+        "key": "val"
+      }
+    },
+    "second": {
+      "description": "Described",
+      "default": {
+        "key": "val"
+      }
+    }
+  }
+}
+`
+
+	c, err := LoadJSON([]byte(js))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if len(c.Variables) != 2 {
+		t.Fatal("config should have 2 variables, found", len(c.Variables))
+	}
+
+	first := &Variable{
+		Name:    "first",
+		Default: map[string]interface{}{"key": "val"},
+	}
+	second := &Variable{
+		Name:        "second",
+		Description: "Described",
+		Default:     map[string]interface{}{"key": "val"},
+	}
+
+	if !reflect.DeepEqual(first, c.Variables[0]) {
+		t.Fatalf("\nexpected: %#v\ngot:      %#v", first, c.Variables[0])
+	}
+
+	if !reflect.DeepEqual(second, c.Variables[1]) {
+		t.Fatalf("\nexpected: %#v\ngot:      %#v", second, c.Variables[1])
+	}
+}
+
+func TestLoadFileBasic_jsonNoName(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "resource-no-name.tf.json"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	actual := resourcesStr(c.Resources)
+	if actual != strings.TrimSpace(basicJsonNoNameResourcesStr) {
 		t.Fatalf("bad:\n%s", actual)
 	}
 }
@@ -455,6 +669,22 @@ func TestLoadDir_override(t *testing.T) {
 	}
 }
 
+func TestLoadDir_overrideVar(t *testing.T) {
+	c, err := LoadDir(filepath.Join(fixtureDir, "dir-override-var"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	actual := variablesStr(c.Variables)
+	if actual != strings.TrimSpace(dirOverrideVarsVariablesStr) {
+		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
 func TestLoadFile_mismatchedVariableTypes(t *testing.T) {
 	_, err := LoadFile(filepath.Join(fixtureDir, "variable-mismatched-type.tf"))
 	if err == nil {
@@ -474,7 +704,19 @@ func TestLoadFile_badVariableTypes(t *testing.T) {
 	}
 
 	errorStr := err.Error()
-	if !strings.Contains(errorStr, "'bad_type' must be of type string") {
+	if !strings.Contains(errorStr, "'bad_type' type must be one of") {
+		t.Fatalf("bad: expected error has wrong text: %s", errorStr)
+	}
+}
+
+func TestLoadFile_variableNoName(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "variable-no-name.tf"))
+	if err == nil {
+		t.Fatalf("bad: expected error")
+	}
+
+	errorStr := err.Error()
+	if !strings.Contains(errorStr, `"variable" must be followed`) {
 		t.Fatalf("bad: expected error has wrong text: %s", errorStr)
 	}
 }
@@ -492,6 +734,34 @@ func TestLoadFile_provisioners(t *testing.T) {
 	actual := resourcesStr(c.Resources)
 	if actual != strings.TrimSpace(provisionerResourcesStr) {
 		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
+func TestLoadFile_provisionersDestroy(t *testing.T) {
+	c, err := LoadFile(filepath.Join(fixtureDir, "provisioners-destroy.tf"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	actual := resourcesStr(c.Resources)
+	if actual != strings.TrimSpace(provisionerDestroyResourcesStr) {
+		t.Fatalf("bad:\n%s", actual)
+	}
+}
+
+func TestLoadFile_unnamedOutput(t *testing.T) {
+	_, err := LoadFile(filepath.Join(fixtureDir, "output-unnamed.tf"))
+	if err == nil {
+		t.Fatalf("bad: expected error")
+	}
+
+	errorStr := err.Error()
+	if !strings.Contains(errorStr, `"output" must be followed`) {
+		t.Fatalf("bad: expected error has wrong text: %s", errorStr)
 	}
 }
 
@@ -581,7 +851,6 @@ func TestLoadFile_ignoreChanges(t *testing.T) {
 	}
 
 	actual := resourcesStr(c.Resources)
-	print(actual)
 	if actual != strings.TrimSpace(ignoreChangesResourcesStr) {
 		t.Fatalf("bad:\n%s", actual)
 	}
@@ -673,7 +942,6 @@ func TestLoad_hclAttributes(t *testing.T) {
 	}
 
 	actual := resourcesStr(c.Resources)
-	print(actual)
 	if actual != strings.TrimSpace(jsonAttributeStr) {
 		t.Fatalf("bad:\n%s", actual)
 	}
@@ -718,7 +986,6 @@ func TestLoad_jsonAttributes(t *testing.T) {
 	}
 
 	actual := resourcesStr(c.Resources)
-	print(actual)
 	if actual != strings.TrimSpace(jsonAttributeStr) {
 		t.Fatalf("bad:\n%s", actual)
 	}
@@ -749,6 +1016,22 @@ func TestLoad_jsonAttributes(t *testing.T) {
 	}
 	if ports[1] != "1000-2000" {
 		t.Fatalf("Bad ports: %s", ports[1])
+	}
+}
+
+func TestLoad_onlyOverride(t *testing.T) {
+	c, err := LoadDir(filepath.Join(fixtureDir, "dir-only-override"))
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if c == nil {
+		t.Fatal("config should not be nil")
+	}
+
+	actual := variablesStr(c.Variables)
+	if actual != strings.TrimSpace(dirOnlyOverrideVariablesStr) {
+		t.Fatalf("bad:\n%s", actual)
 	}
 }
 
@@ -787,14 +1070,24 @@ aws_instance.test (x1)
       inline
 `
 
-const escapedquotesResourcesStr = `
-aws_instance.quotes (x1)
-  ami
+const basicOutputsStr = `
+web_id
   vars
-    user: var.ami
+    resource: aws_instance.web.id
+  description
+    The ID
+web_ip
+  vars
+    resource: aws_instance.web.private_ip
 `
 
-const basicOutputsStr = `
+const basicLocalsStr = `
+literal
+literal_list
+literal_map
+security_group_ids
+  vars
+    resource: aws_security_group.firewall.*.id
 web_ip
   vars
     resource: aws_instance.web.private_ip
@@ -851,6 +1144,11 @@ baz (map)
 foo
   bar
   bar
+`
+
+const basicJsonNoNameResourcesStr = `
+aws_security_group.allow_external_http_https (x1)
+  tags
 `
 
 const dirBasicOutputsStr = `
@@ -938,6 +1236,18 @@ foo
   bar
 `
 
+const dirOverrideVarsVariablesStr = `
+foo
+  baz
+  bar
+`
+
+const dirOnlyOverrideVariablesStr = `
+foo
+  bar
+  bar
+`
+
 const importProvidersStr = `
 aws
   bar
@@ -976,6 +1286,17 @@ aws_instance.web (x1)
     user: var.foo
 `
 
+const provisionerDestroyResourcesStr = `
+aws_instance.web (x1)
+  provisioners
+    shell
+    shell (destroy)
+      path
+    shell (destroy)
+      on_failure = continue
+      path
+`
+
 const connectionResourcesStr = `
 aws_instance.web (x1)
   ami
@@ -988,6 +1309,12 @@ aws_instance.web (x1)
   vars
     resource: aws_security_group.firewall.foo
     user: var.foo
+`
+
+const outputDependsOnStr = `
+value
+  dependsOn
+    foo
 `
 
 const variablesVariablesStr = `
